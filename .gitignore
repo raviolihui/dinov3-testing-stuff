@@ -19,3 +19,4 @@ SIF_DATA_TROPOMI/
 dinov3/
 .dinov3/*
 
+dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth

@@ -1,105 +1,181 @@
-# ==============================
-#  DINOv3 + Hyperbolic Embedding Demo
-# ==============================
+import os
+import numpy as np
 import torch
 import torch.nn as nn
-from torchvision import transforms
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+import torchvision
 from PIL import Image
-import geoopt
-from geoopt import PoincareBall
 import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+from sklearn.metrics import silhouette_score
+from sklearn.cluster import KMeans
+from sklearn.metrics.pairwise import cosine_similarity
+from dinov3.models.vision_transformer import vit_large
 
-# ------------------------------
-# 1️⃣ Load pretrained DINOv3 backbone
-# ------------------------------
-# (Requires torch hub connection)
-dino = torch.hub.load("facebookresearch/dinov2", "dinov2_vitb14")
-dino.eval()  # inference mode
 
-# ------------------------------
-# 2️⃣ Define a hyperbolic projector
-# ------------------------------
-class HyperbolicProjector(nn.Module):
-    def __init__(self, in_dim=768, hidden_dim=2048, out_dim=256, curvature=1.0):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, out_dim),
-        )
-        self.ball = PoincareBall(c=curvature)
-        self.scale = nn.Parameter(torch.tensor(0.1))  # small scale for stability
+# Configuration parameters for hyperbolic tests
+IMG_DIR = "/home/carmenoliver/my_projects/processed_images"
+BATCH_SIZE = 40
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+PATCH_SIZE = 16
+HYPO_DIM = 128
+C = 1.0  # curvature
+NUM_POS = 3  # positives per image
 
-    def forward(self, x):
-        z = self.mlp(x) * self.scale
-        # map Euclidean vector to Poincaré ball
-        h = self.ball.expmap0(z)
-        h = self.ball.projx(h)
-        return h
+#DATASET
+class ImageFolderDataset(Dataset):
+    def __init__(self, img_dir, transform=None):
+        self.img_dir = img_dir
+        self.img_paths = [os.path.join(img_dir, f) for f in os.listdir(img_dir)
+                          if f.lower().endswith((".jpg", ".png"))]
+        self.transform = transform
 
-projector = HyperbolicProjector(in_dim=768)
-projector.eval()
+    def __len__(self):
+        return len(self.img_paths)
 
-# ------------------------------
-# 3️⃣ Load and preprocess an image
-# ------------------------------
-# Use any satellite image patch (RGB) around 224x224 pixels.
-# Example: "amazon_sentinel2_rgb.jpg"
-image_path = "amazon_basin_nasa.jpg"
+    def __getitem__(self, idx):
+        img = Image.open(self.img_paths[idx]).convert("RGB")
+        if self.transform:
+            img = self.transform(img)
+        return img
 
-# DINOv3 expects normalized 224×224 RGB images
-transform = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=(0.485, 0.456, 0.406),
-                         std=(0.229, 0.224, 0.225)),
+# --- Transform ---
+transform = T.Compose([
+    T.Resize(224, interpolation=T.InterpolationMode.BICUBIC),
+    T.CenterCrop(224),
+    T.ToTensor(),
 ])
 
-img = Image.open(image_path).convert("RGB")
-img_t = transform(img).unsqueeze(0)  # shape (1,3,224,224)
+#MODEL COMPONENTS
+class ViTFeatureExtractor(nn.Module):
+    def __init__(self, patch_size=16, pretrained_path=None):
+        super().__init__()
+        self.model = vit_large(patch_size=patch_size, num_register_tokens=0)
+        if pretrained_path:
+            state_dict = torch.load(pretrained_path, map_location="cpu")
+            self.model.load_state_dict(state_dict, strict=False)
+        for p in self.model.parameters():
+            p.requires_grad = False
 
-# ------------------------------
-# 4️⃣ Extract DINOv3 features
-# ------------------------------
-with torch.no_grad():
-    features = dino(img_t)  # shape (1, 768)
+    def forward(self, x):
+        return self.model(x)
 
-# ------------------------------
-# 5️⃣ Map features into hyperbolic space
-# ------------------------------
-with torch.no_grad():
-    hyperbolic_feats = projector(features)  # shape (1, 256)
+class HyperbolicHead(nn.Module):
+    def __init__(self, in_dim, out_dim, c=1.0):
+        super().__init__()
+        self.linear = nn.Linear(in_dim, out_dim)
+        self.c = c
 
-# ------------------------------
-# 6️⃣ Use or visualize embeddings
-# ------------------------------
-print("Euclidean feature shape:", features.shape)
-print("Hyperbolic feature shape:", hyperbolic_feats.shape)
-print("Example norm in hyperbolic ball:",
-      hyperbolic_feats.norm().item())
+    def exp_map(self, x):
+        device = x.device
+        norm = torch.norm(x, dim=-1, keepdim=True)
+        sqrt_c = torch.sqrt(torch.tensor(self.c, device=device))
+        return torch.tanh(sqrt_c * norm) * x / (norm + 1e-5)
 
-ball = PoincareBall(c=1.0)
-with torch.no_grad():
-    # 20 random 2D points inside the Poincaré ball
-    euclidean_points = torch.randn(20, 2) * 0.2
-    hyperbolic_points = ball.expmap0(euclidean_points)
-    norms = hyperbolic_points.norm(dim=1)
+    def forward(self, x):
+        x = self.linear(x)
+        return self.exp_map(x)
 
-# ---- Plot ----
-fig, ax = plt.subplots(figsize=(5, 5))
-circle = plt.Circle((0, 0), 1.0, color='black', fill=False, linestyle='--')
-ax.add_artist(circle)
 
-# color points by norm (distance from center)
-sc = ax.scatter(hyperbolic_points[:, 0],
-                hyperbolic_points[:, 1],
-                c=norms,
-                cmap='viridis',
-                s=80)
+#Poincare operations
 
-plt.colorbar(sc, label='Norm (distance from center)')
-ax.set_xlim(-1.05, 1.05)
-ax.set_ylim(-1.05, 1.05)
-ax.set_aspect('equal', adjustable='box')
-ax.set_title("Points inside the Poincaré ball")
-plt.show()
+def mobius_add(u, v, c=1.0):
+    u2 = (u**2).sum(dim=-1, keepdim=True)
+    v2 = (v**2).sum(dim=-1, keepdim=True)
+    uv = (u * v).sum(dim=-1, keepdim=True)
+    numerator = (1 + 2*c*uv + c*v2)*u + (1 - c*u2)*v
+    denominator = 1 + 2*c*uv + c**2 * u2 * v2
+    return numerator / (denominator + 1e-5)
+
+def poincare_distance(u, v, c=1.0):
+    diff = mobius_add(-u, v, c)
+    norm = diff.norm(dim=-1, keepdim=True)
+    return 2 / torch.sqrt(torch.tensor(c, device=u.device)) * \
+           torch.atanh(torch.clamp(torch.sqrt(torch.tensor(c, device=u.device)) * norm, max=1-1e-5))
+
+def hyperbolic_contrastive_loss(hyp_emb, pos_pairs, neg_pairs=None, margin=1.0):
+    # pos_pairs: tensor of shape [num_pairs, 2]
+    i, j = pos_pairs[:,0], pos_pairs[:,1]
+    d_pos = poincare_distance(hyp_emb[i], hyp_emb[j])
+    loss = (d_pos**2).mean()
+    if neg_pairs is not None:
+        i, j = neg_pairs[:,0], neg_pairs[:,1]
+        d_neg = poincare_distance(hyp_emb[i], hyp_emb[j])
+        loss += (F.relu(margin - d_neg)**2).mean()
+    return loss
+
+def train_hyperbolic_head(features, hyp_head, pos_pairs, lr=1e-3):
+    hyp_head.train()
+    optimizer = torch.optim.Adam(hyp_head.parameters(), lr=lr)
+    optimizer.zero_grad()
+    hyp_emb = hyp_head(features)
+    loss = hyperbolic_contrastive_loss(hyp_emb, pos_pairs)
+    loss.backward()
+    optimizer.step()
+    return hyp_emb, loss.item()
+
+# Visualization functions
+
+def plot_pca_2d(embeddings, title="2D PCA"):
+    pca = PCA(n_components=2)
+    emb_2d = pca.fit_transform(embeddings)
+    plt.figure(figsize=(6,6))
+    plt.scatter(emb_2d[:,0], emb_2d[:,1])
+    plt.title(title)
+    plt.grid(True)
+    plt.show()
+    return emb_2d
+
+def plot_poincare_disk(embeddings, title="Hyperbolic Embeddings"):
+    norms = torch.norm(torch.tensor(embeddings), dim=-1, keepdim=True)
+    scaled = embeddings / (norms * 1.1)
+    fig, ax = plt.subplots(figsize=(6,6))
+    circle = plt.Circle((0,0), 1, color='black', fill=False, linewidth=2)
+    ax.add_artist(circle)
+    plt.scatter(scaled[:,0], scaled[:,1])
+    plt.title(title)
+    plt.gca().set_aspect('equal', adjustable='box')
+    plt.grid(True)
+    plt.show()
+ç
+
+#Code Script 
+
+dataset = ImageFolderDataset(IMG_DIR, transform=transform)
+dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
+
+# --- Load Model ---
+vit_extractor = ViTFeatureExtractor(pretrained_path="/home/carmenoliver/my_projects/dynov3-testing-stuff/dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth").to(DEVICE)
+
+# --- Get One Batch ---
+image_batch = next(iter(dataloader)).to(DEVICE)
+features = vit_extractor(image_batch)
+
+print(f"Feature shape: {features.shape}")
+
+# --- Hyperbolic Head ---
+hyp_head = HyperbolicHead(features.shape[1], HYPO_DIM, c=C).to(DEVICE)
+hyp_emb = hyp_head(features)
+
+# --- Positive pairs ---
+sims = cosine_similarity(features.cpu())
+topk_neighbors = np.argsort(-sims, axis=1)[:, 1:NUM_POS+1]
+i_idx = np.repeat(np.arange(sims.shape[0]), NUM_POS)
+j_idx = topk_neighbors.flatten()
+pos_pairs = torch.tensor(list(zip(i_idx, j_idx)), dtype=torch.long)
+
+# --- Train Hyperbolic Head ---
+hyp_emb, loss_val = train_hyperbolic_head(features, hyp_head, pos_pairs)
+print("Hyperbolic contrastive loss:", loss_val)
+
+# --- Visualization ---
+emb_2d = plot_pca_2d(features.detach().cpu().numpy(), "Euclidean Features")
+plot_poincare_disk(hyp_emb.detach().cpu().numpy(), "Hyperbolic Embeddings")
+
+# --- Show Nearest Neighbors ---
+query_idx = 0
+dists = poincare_distance(hyp_emb[query_idx:query_idx+1], hyp_emb).squeeze().detach().cpu().numpy()
+topk_hyp = dists.argsort()[:5]
+show_selected_images(image_batch, [query_idx]+[i for i in topk_hyp if i != query_idx], title="Query + Hyperbolic Neighbors")

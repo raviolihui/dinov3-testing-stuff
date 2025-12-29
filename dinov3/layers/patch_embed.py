@@ -6,6 +6,7 @@
 import math
 from typing import Callable, Tuple, Union
 
+from duckdb import torch
 from torch import Tensor, nn
 
 
@@ -34,7 +35,7 @@ class PatchEmbed(nn.Module):
         self,
         img_size: Union[int, Tuple[int, int]] = 224,
         patch_size: Union[int, Tuple[int, int]] = 16,
-        in_chans: int = 3,
+        in_chans: int = 12,
         embed_dim: int = 768,
         norm_layer: Callable | None = None,
         flatten_embedding: bool = True,
@@ -59,6 +60,15 @@ class PatchEmbed(nn.Module):
         self.flatten_embedding = flatten_embedding
 
         self.proj = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_HW, stride=patch_HW)
+        if in_chans > 3:
+            with torch.no_grad():
+                # copy RGB weights
+                self.proj.weight[:, 3:] = (
+                    self.proj.weight[:, :3]
+                    .mean(dim=1, keepdim=True)
+                    .repeat(1, in_chans - 3, 1, 1)
+                )
+
         self.norm = norm_layer(embed_dim) if norm_layer else nn.Identity()
 
     def forward(self, x: Tensor) -> Tensor:

@@ -1,0 +1,26 @@
+student:
+  arch: vit_small
+  patch_size: 16
+  in_chans: 12
+
+teacher:
+  momentum_teacher: 0.996
+  in_chans: 12
+
+data:
+  dataset: BigEarthNet12Band
+  root_path: /data/databases/BigEarthNet/BigEarthNet-S2
+  global_crops_size: 224
+  local_crops_size: 96
+  global_crops_scale: [0.4, 1.0]
+  local_crops_scale: [0.05, 0.4]
+  local_crops_number: 8
+
+train:
+  world_size: 1
+  batch_size_per_gpu: 8
+  epochs: 300
+  warmup_epochs: 10
+  lr: 0.0005
+  weight_decay: 0.04
+  weight_decay_end: 0.4

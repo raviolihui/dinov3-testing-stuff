@@ -119,32 +119,34 @@ class DataAugmentationDINO(object):
         )
 
         # color distortions / blurring
-        color_jittering = v2.Compose(
-            [
-                v2.RandomApply(
-                    [v2.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1)],
-                    p=0.8,
-                ),
+        # If working with multispectral inputs (channels != 3), disable color-specific transforms
+        multispectral = len(mean) != 3
+        print(f"DEBUG: mean length is {len(mean)}, mean is {mean}")
+        if multispectral:
+            logger.info("Multispectral mode detected: Disabling RGB-only transforms.")
+            color_jittering = nn.Identity()
+            global_transfo1_extra = GaussianBlur(p=1.0)
+            # Remove RandomSolarize here - it often expects 3 channels/uint8
+            global_transfo2_extra = GaussianBlur(p=0.1) 
+            local_transfo_extra = GaussianBlur(p=0.5)
+        else:
+            # Standard RGB path
+            color_jittering = v2.Compose([
+                v2.RandomApply([v2.ColorJitter(0.4, 0.4, 0.2, 0.1)], p=0.8),
                 v2.RandomGrayscale(p=0.2),
-            ]
-        )
-
-        global_transfo1_extra = GaussianBlur(p=1.0)
-
-        global_transfo2_extra = v2.Compose(
-            [
+            ])
+            global_transfo1_extra = GaussianBlur(p=1.0)
+            global_transfo2_extra = v2.Compose([
                 GaussianBlur(p=0.1),
                 v2.RandomSolarize(threshold=128, p=0.2),
-            ]
-        )
-
-        local_transfo_extra = GaussianBlur(p=0.5)
+            ])
+            local_transfo_extra = GaussianBlur(p=0.5)
 
         # normalization
         self.normalize = v2.Compose(
             [
                 v2.ToImage(),
-                v2.ToDtype(torch.float32, scale=True),
+                v2.ToDtype(torch.float32, scale=False), #big earth net is already in [0, 1]
                 make_normalize_transform(mean=mean, std=std),
             ]
         )
@@ -155,13 +157,19 @@ class DataAugmentationDINO(object):
             self.global_transfo2 = v2.Compose([resize_global, global_transfo2_extra, self.normalize])
             self.local_transfo = v2.Compose([local_transfo_extra, self.normalize])
         else:
-            self.global_transfo1 = v2.Compose(
-                [resize_global, color_jittering, global_transfo1_extra, self.normalize]
-            )
-            self.global_transfo2 = v2.Compose(
-                [resize_global, color_jittering, global_transfo2_extra, self.normalize]
-            )
-            self.local_transfo = v2.Compose([color_jittering, local_transfo_extra, self.normalize])
+            if multispectral:
+                # No color jitter for multispectral
+                self.global_transfo1 = v2.Compose([resize_global, global_transfo1_extra, self.normalize])
+                self.global_transfo2 = v2.Compose([resize_global, global_transfo2_extra, self.normalize])
+                self.local_transfo = v2.Compose([local_transfo_extra, self.normalize])
+            else:
+                self.global_transfo1 = v2.Compose(
+                    [resize_global, color_jittering, global_transfo1_extra, self.normalize]
+                )
+                self.global_transfo2 = v2.Compose(
+                    [resize_global, color_jittering, global_transfo2_extra, self.normalize]
+                )
+                self.local_transfo = v2.Compose([color_jittering, local_transfo_extra, self.normalize])
 
     def __call__(self, image):
         output = {}

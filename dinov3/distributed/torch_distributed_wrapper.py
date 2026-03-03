@@ -226,7 +226,7 @@ class TorchDistributedEnvironment:
 def enable_distributed(
     *,
     set_cuda_current_device: bool = True,
-    overwrite: bool = False,
+    overwrite: bool = True,
     nccl_async_error_handling: bool = False,
     restrict_print_to_main_process: bool = True,
     timeout: timedelta | None = None,
@@ -261,7 +261,13 @@ def enable_distributed(
     if set_cuda_current_device:
         torch.cuda.set_device(torch_env.local_rank)
 
-    dist.init_process_group(backend="nccl", timeout=timeout)
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+
+    torch.cuda.set_device(local_rank)
+
+    dist.init_process_group(backend="nccl", init_method="env://", device_id=torch.device(f"cuda:{local_rank}"))
+
+    #dist.init_process_group(backend="nccl", timeout=timeout) 
     dist.barrier()
 
     if restrict_print_to_main_process:

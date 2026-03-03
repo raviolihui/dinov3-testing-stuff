@@ -2,25 +2,84 @@ student:
   arch: vit_small
   patch_size: 16
   in_chans: 12
-
+  pretrained_weights: /home/carmenoliver/my_projects/dinov3-testing-stuff/dinov3_vits16_pretrain_lvd1689m-08c60483.pth
 teacher:
   momentum_teacher: 0.996
   in_chans: 12
 
-data:
-  dataset: BigEarthNet12Band
-  root_path: /data/databases/BigEarthNet/BigEarthNet-S2
-  global_crops_size: 224
-  local_crops_size: 96
-  global_crops_scale: [0.4, 1.0]
-  local_crops_scale: [0.05, 0.4]
-  local_crops_number: 8
+# data:
+#   dataset: BigEarthNet12Band
+#   root_path: /data/databases/BigEarthNet/BigEarthNet-S2
+#   global_crops_size: 224
+#   local_crops_size: 96
+#   global_crops_scale: [0.4, 1.0]
+#   local_crops_scale: [0.05, 0.4]
+#   local_crops_number: 8
+
+crops:
+  # For 12-band data we set per-channel mean/std. These are placeholders (no normalization).
+  # It's recommended to compute dataset statistics and replace these values.
+  rgb_mean: [
+    0.08968267921350617,
+    0.08937971919304992,
+    0.07754635287737796,
+    0.0748453499657254,
+    0.12482883545836469,
+    0.199888002230358,
+    0.22430811927908423,
+    0.23914264464239368,
+    0.2429435698693647,
+    0.24374663875653663,
+    0.1576949613459183,
+    0.10577378558591129
+  ]
+  rgb_std: [
+    0.13908576098268433,
+    0.13606287184313895,
+    0.15512758607875962,
+    0.15579001807831083,
+    0.1377718097656539,
+    0.14866629658372169,
+    0.15455780840607147,
+    0.1649837070187826,
+    0.15703906153964714,
+    0.14874778287863058,
+    0.10793598618106068,
+    0.08256841326021963
+  ]
 
 train:
-  world_size: 1
-  batch_size_per_gpu: 8
-  epochs: 300
-  warmup_epochs: 10
+  batch_size_per_gpu: 16
+  dataset_path: BigEarthNet12Band:root=/data/databases/BigEarthNet/BigEarthNet-S2
+  compile: false
+optim:
+  epochs: 10
+  optimizer: adamw
+  warmup_epochs: 3
   lr: 0.0005
   weight_decay: 0.04
   weight_decay_end: 0.4
+
+  # xformers: false
+  # flash_attn: false
+  # checkpointing: false
+  #num_workers: 2
+# fsdp:
+#   enabled: false
+
+# compile:
+#   enabled: false
+
+# amp:
+#   enabled: false
+# precision: 32
+
+# evaluation:
+#   knn:
+#     enable: True
+#     test_dataset: "BigEarthNet12Band:root=/data/databases/BigEarthNet/BigEarthNet-S2:split=val"
+#     num_workers: 0
+#     train:
+#       batch_size: 128
+#       ks: [10, 20, 100]
+    

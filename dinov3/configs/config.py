@@ -39,9 +39,12 @@ class DinoV3SetupArgs:
 
 def apply_scaling_rules_to_cfg(cfg):  # to fix
     assert distributed.is_enabled(), "Setup distributed to get global size !"
-    if "schedules" in cfg:
+    #if not distributed.is_enabled():
+    #    logger.info("Distributed not enabled: assuming world_size = 1")
+    #    return cfg
+    #if "schedules" in cfg:
         # For schedules v2, the scaling rules are applied when building the schedules, the config is not modified
-        return cfg
+    #    return cfg
 
     if cfg.optim.scaling_rule == "linear_wrt_256":
         old_lr = cfg.optim.lr
@@ -195,7 +198,7 @@ def setup_job(
 
     if distributed_enabled:
         distributed.enable(
-            overwrite=True,
+            overwrite=False,
             nccl_async_error_handling=True,
             restrict_print_to_main_process=restrict_print_to_main_process,
             timeout=distributed_timeout,

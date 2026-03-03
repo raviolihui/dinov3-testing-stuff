@@ -22,7 +22,14 @@ class ExtendedVisionDataset(VisionDataset):
         self.image_decoder = image_decoder
         self.target_decoder = target_decoder
 
-    def get_image_data(self, index: int) -> bytes:
+    def get_image_data(self, index: int):
+        """Return raw image data for a sample.
+
+        Subclasses may return either encoded image bytes (e.g. PNG/JPEG)
+        or a tensor/NumPy array. The default decoders only handle bytes,
+        so non-byte types should be passed directly to the transform
+        pipeline.
+        """
         raise NotImplementedError
 
     def get_target(self, index: int) -> Any:
@@ -31,9 +38,17 @@ class ExtendedVisionDataset(VisionDataset):
     def __getitem__(self, index: int) -> Tuple[Any, Any]:
         try:
             image_data = self.get_image_data(index)
-            image = self.image_decoder(image_data).decode()
         except Exception as e:
             raise RuntimeError(f"can not read image for sample {index}") from e
+
+        # If the subclass returns encoded bytes, use the configured decoder.
+        if isinstance(image_data, (bytes, bytearray, memoryview)):
+            image = self.image_decoder(image_data).decode()
+        else:
+            # For tensor / NumPy array data, pass through as-is and let
+            # the transforms handle it.
+            image = image_data
+
         target = self.get_target(index)
         target = self.target_decoder(target).decode()
 

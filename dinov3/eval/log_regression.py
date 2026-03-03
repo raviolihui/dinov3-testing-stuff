@@ -20,7 +20,13 @@ from torchmetrics import MetricTracker
 
 from dinov3.data import SamplerType, make_data_loader, make_dataset
 from dinov3.data.adapters import DatasetWithEnumeratedTargets
-from dinov3.data.transforms import CROP_DEFAULT_SIZE, get_target_transform, make_classification_eval_transform
+from dinov3.data.transforms import (
+    CROP_DEFAULT_SIZE,
+    get_target_transform,
+    make_classification_eval_transform,
+    make_forestnet_12b_eval_transform,
+    make_sentinel2_12b_minmax_eval_transform,
+)
 from dinov3.distributed import get_rank, get_world_size
 from dinov3.eval.data import (
     create_train_dataset_dict,
@@ -87,6 +93,9 @@ class EvalConfig:
 class TransformConfig:
     resize_size: int = CROP_DEFAULT_SIZE
     crop_size: int = CROP_DEFAULT_SIZE
+    # We want these to be Optional lists of floats, defaulting to None
+    mean: Optional[List[float]] = None 
+    std: Optional[List[float]] = None
 
 
 @dataclass
@@ -269,10 +278,38 @@ def get_best_logreg_with_features(
     return logreg_model
 
 
-def make_transform(config: TransformConfig):
-    if config.resize_size / config.crop_size != 1:
-        logger.warning(f"Default resize / crop ratio is 1, here we have {config.resize_size} / {config.crop_size}")
-    transform = make_classification_eval_transform(resize_size=config.resize_size, crop_size=config.crop_size)
+def make_transform(config: TransformConfig, *, use_forestnet_12b: bool):
+    resize_size = config.resize_size
+    crop_size = config.crop_size
+
+    # Avoid division by zero and only log ratio when both are positive
+    if crop_size is not None and crop_size > 0 and resize_size is not None and resize_size > 0:
+        if resize_size / crop_size != 1:
+            logger.warning(
+                f"Default resize / crop ratio is 1, here we have {resize_size} / {crop_size}"
+            )
+    else:
+        logger.info(
+            f"Resize/crop disabled or non-standard (resize_size={resize_size}, crop_size={crop_size}); "
+            "skipping resize/crop ratio check."
+        )
+
+    if use_forestnet_12b:
+        logger.info("Using Sentinel-2 12-band MinMax eval transform (GeoBench/ForestNet mode)")
+        kwargs = {}
+        if config.mean is not None:
+             kwargs["mean"] = config.mean
+        if config.std is not None:
+             kwargs["std"] = config.std
+             
+        transform = make_sentinel2_12b_minmax_eval_transform(
+            resize_size=resize_size, 
+            crop_size=crop_size,
+            **kwargs
+        )
+    else:
+        transform = make_classification_eval_transform(resize_size=resize_size, crop_size=crop_size)
+
     return transform
 
 
@@ -328,7 +365,16 @@ def eval_log_regression_with_model(*, model: torch.nn.Module, autocast_dtype, co
     start = time.time()
     cudnn.benchmark = True
 
-    transform = make_transform(config.transform)
+    # Decide if we should use ForestNet 12-band normalization based on dataset strings
+    use_forestnet_12b = False
+    for ds_str in (config.train.dataset, config.eval.test_dataset):
+        if isinstance(ds_str, str) and (
+            "GeoBenchCls12" in ds_str or "GeoBenchCls" in ds_str
+        ):
+             use_forestnet_12b = True
+        break
+
+    transform = make_transform(config.transform, use_forestnet_12b=use_forestnet_12b)
     config.eval.batch_size = config.eval.batch_size or config.train.batch_size  # use train batch size for eval if None
 
     # Setting up train and val datasets

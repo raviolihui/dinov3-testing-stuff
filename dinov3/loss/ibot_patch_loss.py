@@ -4,6 +4,8 @@
 # the terms of the DINOv3 License Agreement.
 
 import math
+import os
+import logging
 
 import torch
 import torch.distributed as dist
@@ -61,6 +63,7 @@ class SinkhornKnoppTeacher(nn.Module):
 class iBOTPatchLoss(nn.Module):
     def __init__(self, patch_out_dim, student_temp=0.1, center_momentum=0.9):
         super().__init__()
+        self._logger = logging.getLogger("dinov3")
         self.student_temp = student_temp
         self.center_momentum = center_momentum
         self.register_buffer("center", torch.full((1, 1, patch_out_dim), math.nan))
@@ -69,7 +72,17 @@ class iBOTPatchLoss(nn.Module):
         self.len_teacher_patch_tokens = None
         self.async_batch_center = None
         self.sinkhorn_knopp_teacher = SinkhornKnoppTeacher()
-        self.sinkhorn_knopp_teacher.compile()
+        # Only attempt to compile if not explicitly disabled. Compilation can fail
+        # on some PyTorch/Inductor builds; fallback to eager in that case.
+        if os.environ.get("DINO_DISABLE_TORCH_COMPILE", "0") not in ("1", "true", "True"): 
+            try:
+                self.sinkhorn_knopp_teacher.compile()
+                self._logger.info("Compiled SinkhornKnoppTeacher with torch.compile")
+            except Exception as e:
+                self._logger.warning(
+                    "Falling back to eager for SinkhornKnoppTeacher due to compile error: %s",
+                    repr(e),
+                )
 
     def init_weights(self) -> None:
         self.center.zero_()

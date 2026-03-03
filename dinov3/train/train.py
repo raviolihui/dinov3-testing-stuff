@@ -39,6 +39,12 @@ from dinov3.logging import MetricLogger, setup_logging
 from dinov3.train.cosine_lr_scheduler import CosineScheduler, linear_warmup_cosine_decay
 from dinov3.train.multidist_meta_arch import MultiDistillationMetaArch
 from dinov3.train.ssl_meta_arch import SSLMetaArch
+from pathlib import Path
+
+# Optional in-training k-NN evaluation (uses the eval/knn module)
+from dinov3.eval.helpers import args_dict_to_dataclass
+from dinov3.eval.knn import KnnEvalConfig, eval_knn_with_model
+
 
 assert torch.__version__ >= (2, 1)
 torch.backends.cuda.matmul.allow_tf32 = True  # pytorch 1.12 sets this to false by default
@@ -57,6 +63,16 @@ def get_args_parser(add_help: bool = True):
     )
     parser.add_argument("--eval-only", action="store_true", help="perform evaluation only")
     parser.add_argument("--eval", type=str, default="", help="Eval type to perform")
+    # In-training k-NN evaluation CLI overrides
+    parser.add_argument("--knn-enable", action="store_true", help="Enable in-training k-NN evaluation")
+    parser.add_argument("--knn-freq-iters", type=int, default=None, help="Frequency (in iterations) to run in-training k-NN")
+    parser.add_argument("--knn-test-dataset", type=str, default=None, help="Dataset string for k-NN test set (overrides train dataset)")
+    parser.add_argument(
+        "--knn-ks",
+        type=str,
+        default=None,
+        help="Comma-separated k values for k-NN (e.g. '10,20,100'). If omitted uses defaults from config.",
+    )
     parser.add_argument(
         "--eval_pretrained_weights",
         type=str,
@@ -400,6 +416,15 @@ def do_train(cfg, model, resume=False):
             dont_save=[k for k, _ in model.state_dict().items() if k.startswith("teacher")],
         )
     model.init_weights()
+    
+    # Mixed precision setup (AMP)
+    # cfg.compute_precision.param_dtype can be 'fp32', 'fp16' or 'bf16'
+    param_dtype = cfg.compute_precision.param_dtype
+    use_fp16 = param_dtype == "fp16"
+    use_bf16 = param_dtype == "bf16"
+    grad_scaler = torch.cuda.amp.GradScaler(enabled=use_fp16)
+    # attach scaler to model so backprop inside model can use it
+    setattr(model, "_grad_scaler", grad_scaler)
     start_iter = 0
     if resume and (last_checkpoint_dir := find_latest_checkpoint(ckpt_dir)):
         logger.info(f"Checkpoint found {last_checkpoint_dir}")
@@ -480,12 +505,27 @@ def do_train(cfg, model, resume=False):
         last_layer_lr = last_layer_lr_schedule[it]
         apply_optim_scheduler(optimizer, lr, wd, last_layer_lr)
 
-        # Forward backward
+        # Forward backward (with optional AMP autocast)
         optimizer.zero_grad(set_to_none=True)
-        total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        # choose autocast dtype
+        if use_bf16:
+            autocast_dtype = torch.bfloat16
+        elif use_fp16:
+            autocast_dtype = torch.float16
+        else:
+            autocast_dtype = None
+
+        if autocast_dtype is not None:
+            with torch.cuda.amp.autocast(dtype=autocast_dtype):
+                total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
+        else:
+            total_loss, metrics_dict = model.forward_backward(data, teacher_temp=teacher_temp, iteration=it)
 
         # Gradient clipping
         if cfg.optim.clip_grad:
+            # If using fp16 with GradScaler, unscale the gradients first
+            if use_fp16:
+                grad_scaler.unscale_(optimizer)
             for k, v in student.items():
                 grad_norm = torch.nn.utils.clip_grad_norm_(
                     v.parameters(),
@@ -528,7 +568,12 @@ def do_train(cfg, model, resume=False):
         else:
             consecutive_nan_count = 0
         # Step optimizer
-        optimizer.step()
+        if use_fp16:
+            # use GradScaler to step and update
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            optimizer.step()
         model.update_ema(mom)
 
         # [GRAM] Update gram teacher when using gram teacher and frequent updates
@@ -561,6 +606,33 @@ def do_train(cfg, model, resume=False):
         # Checkpointing
         if (iteration + 1) % cfg.checkpointing.period == 0:
             torch.cuda.synchronize()
+
+            # if (iteration + 1) % cfg.train.OFFICIAL_EPOCH_LENGTH == 0:
+            #     torch.cuda.synchronize()
+
+            #     if distributed.is_subgroup_main_process():
+            #         logger.info(f"--- Iteration {iteration}: Running Official k-NN Eval ---")
+        
+            #     # 1. Consolidate the teacher weights for evaluation
+            #     # We use the EMA (Teacher) because it provides more stable features
+            #     eval_weights = model.model_ema.state_dict()
+            #     knn_dataclass_config = KnnEvalConfig(
+            #         ks= [10, 20, 100], 
+            #         temperature=0.07,
+            #     )
+            #     # 2. Call the built-in DINOv3 k-NN evaluator
+            #     # Note: You must have defined cfg.evaluation.knn.test_dataset in your YAML
+            #     results = eval_knn_with_model(
+            #         model=model.model_ema,
+            #         autocast_dtype=torch.bfloat16, # Match your training precision
+            #         config=knn_dataclass_config   # Use the config helper already in your script
+            #     )
+        
+            #     # 3. Log results to your training metrics file
+            #     logger.info(f"k-NN Top-1 Acc: {results['accuracy']:.4f}")
+            #     metric_logger.update(knn_acc=results['accuracy'])
+
+
             save_checkpoint(
                 ckpt_dir / str(iteration),
                 iteration=iteration,
@@ -569,6 +641,8 @@ def do_train(cfg, model, resume=False):
                 overwrite=True,
                 process_group=process_subgroup,
             )
+
+
             if distributed.is_subgroup_main_process():
                 keep_last_n_checkpoints(ckpt_dir, cfg.checkpointing.max_to_keep)
                 if "keep_every" in cfg.checkpointing and (iteration + 1) % cfg.checkpointing.keep_every == 0:
@@ -577,15 +651,17 @@ def do_train(cfg, model, resume=False):
         iteration = iteration + 1
     metric_logger.synchronize_between_processes()
 
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()} 
 
-
+    
 def main(argv=None):
+    
     if argv is None:
         args = get_args_parser().parse_args()
     else:
-        args = get_args_parser().parse_args(argv[1:])
-        args.output_dir = sys.argv[1]
+        # When invoked programmatically (e.g., via the submit launcher), argv is a list
+        # of CLI arguments. Parse it as-is without slicing and don't override output_dir.
+        args = get_args_parser().parse_args(argv)
     if args.multi_distillation:
         print("performing multidistillation run")
         cfg = setup_multidistillation(args)
@@ -594,7 +670,23 @@ def main(argv=None):
         assert cfg.MODEL.META_ARCHITECTURE == "MultiDistillationMetaArch"
     else:
         setup_job(output_dir=args.output_dir, seed=args.seed)
-        cfg = setup_config(args, strict_cfg=False)
+        # Convert CLI k-NN flags into config overrides so they can be accessed via cfg.evaluation.knn
+        if getattr(args, "knn_enable", False):
+            args.opts = args.opts or []
+            args.opts.append("evaluation.knn.enable=True")
+        if getattr(args, "knn_freq_iters", None) is not None:
+            args.opts = args.opts or []
+            args.opts.append(f"evaluation.knn.freq_iterations={args.knn_freq_iters}")
+        if getattr(args, "knn_test_dataset", None) is not None:
+            args.opts = args.opts or []
+            args.opts.append(f"evaluation.knn.test_dataset={args.knn_test_dataset}")
+        if getattr(args, "knn_ks", None) is not None:
+            # Convert comma separated to yaml-friendly list string
+            ks_list = [k.strip() for k in args.knn_ks.split(",") if k.strip()]
+            ks_value = ",".join(ks_list)
+            args.opts = args.opts or []
+            args.opts.append(f"evaluation.knn.train.ks={ks_value}")
+        cfg = setup_config(args, strict_cfg=True)
         logger.info(cfg)
         setup_logging(
             output=os.path.join(os.path.abspath(args.output_dir), "nan_logs"),
@@ -630,6 +722,7 @@ def main(argv=None):
             + 1
         )
         return do_test(cfg, model, f"manual_{iteration}")
+    
     do_train(cfg, model, resume=not args.no_resume)
 
 

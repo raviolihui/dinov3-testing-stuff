@@ -21,3 +21,13 @@ dinov3/
 
 dinov3_vitl16_pretrain_sat493m-eadcf0ff.pth
 dinov3_vits16_pretrain_lvd1689m-08c60483.pth
+
+outputs_full/
+outputs_probe_knn/
+outputs_test/
+
+tmp/
+*.pth
+pics/
+training_metrics.json   
+*.pyc

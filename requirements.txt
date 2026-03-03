@@ -13,3 +13,5 @@ pylint==3.3.8
 ruff==0.12.8
 scikit-learn
 geoopt
+rasterio
+duckdb

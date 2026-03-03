@@ -18,6 +18,7 @@ import dinov3.distributed as distributed
 from dinov3.data import DatasetWithEnumeratedTargets, SamplerType, make_data_loader
 from dinov3.eval.accumulators import NoOpAccumulator, ResultsAccumulator
 from dinov3.logging import MetricLogger
+from dinov3.distributed import get_world_size  # already imported above in this file
 
 logger = logging.getLogger("dinov3")
 
@@ -151,16 +152,14 @@ def evaluate(
     return metric_logger_stats, stats, accumulated_results
 
 
-def all_gather_and_flatten(tensor_rank):
-    tensor_all_ranks = torch.empty(
-        distributed.get_world_size(),
-        *tensor_rank.shape,
-        dtype=tensor_rank.dtype,
-        device=tensor_rank.device,
-    )
-    tensor_list = list(tensor_all_ranks.unbind(0))
+def all_gather_and_flatten(tensor_rank: torch.Tensor):
+    # Single-process / single-GPU: no need for distributed collectives
+    if get_world_size() == 1:
+        return tensor_rank
+
+    tensor_list = [torch.zeros_like(tensor_rank) for _ in range(get_world_size())]
     torch.distributed.all_gather(tensor_list, tensor_rank.contiguous())
-    return tensor_all_ranks.flatten(end_dim=1)
+    return torch.cat(tensor_list)
 
 
 def extract_features(model, dataset, batch_size, num_workers, gather_on_cpu=False):
@@ -184,9 +183,9 @@ def extract_features_with_dataloader(model, data_loader, sample_count, gather_on
     features, all_labels = None, None
     for samples, (index, labels_rank) in metric_logger.log_every(data_loader, 10):
         samples = samples.cuda(non_blocking=True)
-        labels_rank = labels_rank.cuda(non_blocking=True)
-        index = index.cuda(non_blocking=True)
-        features_rank = model(samples).float()
+
+        with torch.no_grad():
+            features_rank = model(samples).float()
 
         # init storage feature matrix
         if features is None:
@@ -197,9 +196,9 @@ def extract_features_with_dataloader(model, data_loader, sample_count, gather_on
             logger.info(f"Storing features into tensor of shape {features.shape}")
 
         # share indexes, features and labels between processes
-        index_all = all_gather_and_flatten(index).to(gather_device)
-        features_all_ranks = all_gather_and_flatten(features_rank).to(gather_device)
-        labels_all_ranks = all_gather_and_flatten(labels_rank).to(gather_device)
+        index_all = all_gather_and_flatten(index.to(gather_device)).to(gather_device)
+        features_all_ranks = all_gather_and_flatten(features_rank.to(gather_device)).to(gather_device)
+        labels_all_ranks = all_gather_and_flatten(labels_rank.to(gather_device)).to(gather_device)
 
         # update storage feature matrix
         if len(index_all) > 0:

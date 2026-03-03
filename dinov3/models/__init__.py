@@ -36,6 +36,7 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
         vit_kwargs = dict(
             img_size=img_size,
             patch_size=args.patch_size,
+            in_chans=args.in_chans,
             pos_embed_rope_base=args.pos_embed_rope_base,
             pos_embed_rope_min_period=args.pos_embed_rope_min_period,
             pos_embed_rope_max_period=args.pos_embed_rope_max_period,
@@ -64,6 +65,74 @@ def build_model(args, only_teacher=False, img_size=224, device=None):
             drop_path_rate=args.drop_path_rate,
         )
         embed_dim = student.embed_dim
+        # If a pretrained checkpoint is provided, attempt to load it and adapt
+        # 3-channel patch-embed weights to the requested `in_chans` by copying
+        # the RGB weights into the first three channels and filling the extra
+        # channels with the mean of the RGB filters.
+        try:
+            pretrained_path = getattr(args, "pretrained_weights", None)
+        except Exception:
+            pretrained_path = None
+        if pretrained_path:
+            try:
+                p = Path(pretrained_path)
+                if p.exists() and p.is_file():
+                    logger.info(f"Loading pretrained weights from {pretrained_path} and adapting patch_embed for in_chans={args.in_chans}")
+                    ckpt = torch.load(pretrained_path, map_location="cpu")
+                    # some checkpoints store under a 'teacher' key
+                    if isinstance(ckpt, dict) and "teacher" in ckpt and isinstance(ckpt["teacher"], dict):
+                        ckpt = ckpt["teacher"]
+                    # normalize keys (remove common prefixes)
+                    norm_ckpt = {k.replace("module.", "").replace("backbone.", ""): v for k, v in ckpt.items()}
+
+                    def adapt_and_load(model):
+                        sd = model.state_dict()
+                        # find any ckpt key that ends with the target state key
+                        for key in list(sd.keys()):
+                            if key.endswith("patch_embed.proj.weight"):
+                                # search for a matching key in norm_ckpt
+                                matched = None
+                                for ck in norm_ckpt.keys():
+                                    if ck.endswith("patch_embed.proj.weight"):
+                                        matched = ck
+                                        break
+                                if matched is None:
+                                    continue
+                                old_w = norm_ckpt[matched]
+                                if old_w.ndim == 4 and old_w.shape[1] == 3 and args.in_chans > 3:
+                                    out, in_ch, kh, kw = old_w.shape
+                                    new_w = torch.zeros((out, args.in_chans, kh, kw), dtype=old_w.dtype)
+                                    # copy RGB
+                                    new_w[:, :3, :, :] = old_w
+                                    # fill remaining channels with mean of RGB
+                                    mean_rgb = old_w.mean(dim=1, keepdim=True)  # shape [out,1,kh,kw]
+                                    repeat_count = args.in_chans - 3
+                                    new_w[:, 3:, :, :] = mean_rgb.repeat(1, repeat_count, 1, 1)
+                                    # place into model state dict and load
+                                    sd[key] = new_w
+                                else:
+                                    # if channels already match or not 3, try direct copy if shapes align
+                                    try:
+                                        if sd[key].shape == old_w.shape:
+                                            sd[key] = old_w
+                                    except Exception:
+                                        pass
+                        # load updated state (non-strict to avoid missing keys)
+                        model.load_state_dict(sd, strict=False)
+
+                    # adapt for both student and teacher if possible
+                    try:
+                        adapt_and_load(student)
+                    except Exception:
+                        logger.exception("Failed to adapt/load pretrained weights into student")
+                    try:
+                        adapt_and_load(teacher)
+                    except Exception:
+                        logger.exception("Failed to adapt/load pretrained weights into teacher")
+                else:
+                    logger.info(f"Pretrained path {pretrained_path} does not exist or is not a file; skipping pretrained load")
+            except Exception:
+                logger.exception("Error while loading/adapting pretrained weights; continuing with random init")
     else:
         raise NotImplementedError(f"Unrecognized architecture {args.arch}")
     student = init_fp8(student, args)

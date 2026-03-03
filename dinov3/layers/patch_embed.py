@@ -6,7 +6,7 @@
 import math
 from typing import Callable, Tuple, Union
 
-from duckdb import torch
+import torch
 from torch import Tensor, nn
 
 

@@ -8,3 +8,5 @@ from .coco_captions import CocoCaptions
 from .image_net import ImageNet
 from .image_net_22k import ImageNet22k
 from .bigearthnet import BigEarthNet12Band
+from .geobench import GeoBenchCls12
+from .core_s2l2a import CoreS2L2A, S2L2A_BAND_NAMES, TARGET_SIZE

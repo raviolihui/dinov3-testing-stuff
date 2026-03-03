@@ -175,6 +175,22 @@ evaluation:
   config_files:  # Must be in fairvit/eval/configs
     high_freq: benchmark_high_frequency.yaml  # More often
     low_freq: benchmark_low_frequency.yaml  # Less often
+  knn:
+    enable: false
+    # Frequency to run k-NN in iterations. 0 or null means disabled unless `enable` is true.
+    freq_iterations: 0
+    # Path or dataset string to use as test set for k-NN (if null uses train dataset)
+    test_dataset: null
+    # Number of workers used during evaluation
+    num_workers: 5
+    # Save predictions/targets to the output dir
+    save_results: false
+    train:
+      batch_size: 256
+      num_workers: 5
+      ks: [10, 20, 100, 200]
+      temperature: 0.07
+      skip_first_nn: false
 checkpointing:
   period: 3750
   max_to_keep: 3

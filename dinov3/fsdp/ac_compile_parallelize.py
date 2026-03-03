@@ -10,11 +10,23 @@ from typing import Any, List, Optional
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
-from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
-from torch.distributed.fsdp import register_fsdp_forward_method
-from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
-from torch.utils.checkpoint import create_selective_checkpoint_contexts
+try:
+    from torch.distributed._composable.fsdp import MixedPrecisionPolicy, fully_shard
+    from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+    from torch.distributed.fsdp import register_fsdp_forward_method
+    from torch.distributed.fsdp._fully_shard._fsdp_state import FSDPState
+    from torch.utils.checkpoint import create_selective_checkpoint_contexts
+except ImportError:
+    MixedPrecisionPolicy = None
+    fully_shard = None
+    DeviceMesh = None
+    init_device_mesh = None
+    register_fsdp_forward_method = None
+    FSDPState = None
+    create_selective_checkpoint_contexts = None
+
+
+
 
 from dinov3.utils import utils
 
@@ -71,11 +83,12 @@ def ac_compile_parallelize(
                 torch.ops.aten._scaled_dot_product_flash_attention.default,
                 torch.ops._c10d_functional.reduce_scatter_tensor.default,
             ]
-            _checkpointing_wrapper = partial(
-                checkpoint_wrapper,
-                context_fn=partial(create_selective_checkpoint_contexts, _save_list),
-                preserve_rng_state=True,
-            )
+            if create_selective_checkpoint_contexts is not None:
+                _checkpointing_wrapper = partial(
+                    checkpoint_wrapper,
+                    context_fn=partial(create_selective_checkpoint_contexts, _save_list),
+                    preserve_rng_state=True,
+                )
             logger.info("using selective checkpointing on backbone with selective policy")
         for i, b in enumerate(backbone.blocks):
             backbone.blocks[i] = _checkpointing_wrapper(b)
@@ -112,9 +125,10 @@ def ac_compile_parallelize(
         "bf16": torch.bfloat16,
         "fp32": torch.float32,
     }
-    mp_policy = MixedPrecisionPolicy(
-        param_dtype=DTYPE_MAP[cfg.compute_precision.param_dtype],
-        reduce_dtype=DTYPE_MAP[cfg.compute_precision.reduce_dtype],
+    if MixedPrecisionPolicy is not None:
+        mp_policy = MixedPrecisionPolicy(
+            param_dtype=DTYPE_MAP[cfg.compute_precision.param_dtype],
+            reduce_dtype=DTYPE_MAP[cfg.compute_precision.reduce_dtype],
     )
 
     for m, pg in zip(all_models, all_pgs):
@@ -148,7 +162,8 @@ def ac_compile_parallelize(
                 prev_block.set_modules_to_forward_prefetch([next_block])
                 next_block.set_modules_to_backward_prefetch([prev_block])
             fully_shard(m.backbone, **fsdp_config, reshard_after_forward=True).set_reduce_scatter_divide_factor(1)
-            register_fsdp_forward_method(m.backbone, "get_intermediate_layers")
+            if register_fsdp_forward_method is not None:
+                register_fsdp_forward_method(m.backbone, "get_intermediate_layers")
 
     # 4/ Move to `cuda` device
     for model in all_models:

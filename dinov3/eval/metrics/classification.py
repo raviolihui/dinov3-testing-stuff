@@ -45,6 +45,7 @@ class ClassificationMetricType(Enum):
     IMAGENET_C_METRIC = "imagenet_c_metric"
     MACRO_AVERAGED_MEAN_RECIPROCAL_RANK = "macro_averaged_mean_reciprocal_rank"
     MACRO_MULTILABEL_AVERAGE_PRECISION = "macro_multilabel_average_precision"
+    BIGEARTHNET_METRICS = "bigearthnet_metrics"
 
     @property
     def averaging_method(self):
@@ -95,6 +96,14 @@ def _make_default_ks(num_classes: int):
 def build_classification_metric(
     metric_type: ClassificationMetricType, *, num_classes: int, ks: Optional[tuple] = None, dataset=None
 ):
+    # Auto-detect BigEarthNet (43 classes) and provide a comprehensive multilabel metric suite
+    # This prevents the default 'mean_accuracy' from being used incorrectly on multilabel targets.
+    is_bigearthnet = (num_classes == 43) or (dataset is not None and "bigearthnet" in str(dataset).lower())
+
+    if is_bigearthnet and not metric_type.is_multilabel:
+         logger.info(f"Detected BigEarthNet/multilabel context. Switching metric from {metric_type} to BIGEARTHNET_METRICS.")
+         metric_type = ClassificationMetricType.BIGEARTHNET_METRICS
+
     if metric_type.is_topk_accuracy_metric:
         ks = ks or _make_default_ks(num_classes)
         return build_topk_accuracy_metric(average_type=metric_type.averaging_method, num_classes=num_classes, ks=ks)
@@ -135,6 +144,18 @@ def build_classification_metric(
         )
     elif metric_type == ClassificationMetricType.MACRO_AVERAGED_MEAN_RECIPROCAL_RANK:
         return MetricCollection({"top-1": MacroAveragedMeanReciprocalRank(num_classes=int(num_classes))})
+    elif metric_type == ClassificationMetricType.MACRO_MULTILABEL_AVERAGE_PRECISION:
+        # mAP for multilabel
+        return MetricCollection({"mAP": MultilabelAveragePrecision(num_labels=int(num_classes), average="macro", thresholds=None)})
+    elif metric_type == ClassificationMetricType.BIGEARTHNET_METRICS:
+        # Provide a suite of metrics for BigEarthNet: mAP, macro/micro F1, and AnyMatchAccuracy top-1
+        return MetricCollection({
+            "map": MultilabelAveragePrecision(num_labels=int(num_classes), average="macro"),
+            "macro_f1": MultilabelF1Score(num_labels=int(num_classes), average="macro"),
+            "micro_f1": MultilabelF1Score(num_labels=int(num_classes), average="micro"),
+            "top-1": AnyMatchAccuracy(top_k=1, num_classes=int(num_classes)),
+        })
+
     raise ValueError(f"Unknown metric type {metric_type}")
 
 
@@ -198,19 +219,24 @@ class AnyMatchAccuracy(Metric):
 
     def update(self, preds: Tensor, target: Tensor) -> None:  # type: ignore
         # preds [B, D]
-        # target [B, A]
-        # preds_oh [B, D] with 0 and 1
-        # select top K highest probabilities, use one hot representation
+        # target either indices [B, A] or multi-hot [B, D]
+        # Build one-hot for top-k predictions
         preds_oh = select_topk(preds, self.top_k)
-        # target_oh [B, D + 1] with 0 and 1
-        target_oh = torch.zeros((preds_oh.shape[0], preds_oh.shape[1] + 1), device=target.device, dtype=torch.int32)
-        target = target.long()
-        # for undefined targets (-1) use a fake value `num_classes`
-        target[target == -1] = self.num_classes
-        # fill targets, use one hot representation
-        target_oh.scatter_(1, target, 1)
-        # target_oh [B, D] (remove the fake target at index `num_classes`)
-        target_oh = target_oh[:, :-1]
+
+        # If target is already multi-hot per class, use it directly
+        if target.ndim == 2 and target.shape[1] == self.num_classes:
+            target_oh = target.int()
+        else:
+            # Otherwise, scatter indices to one-hot
+            target_oh = torch.zeros((preds_oh.shape[0], preds_oh.shape[1] + 1), device=target.device, dtype=torch.int32)
+            target = target.long()
+            # for undefined targets (-1) use a fake value `num_classes`
+            target[target == -1] = self.num_classes
+            # fill targets, use one hot representation
+            target_oh.scatter_(1, target, 1)
+            # target_oh [B, D] (remove the fake target at index `num_classes`)
+            target_oh = target_oh[:, :-1]
+
         # tp [B] with 0 and 1
         tp = (preds_oh * target_oh == 1).sum(dim=1)
         # at least one match between prediction and target

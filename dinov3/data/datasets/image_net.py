@@ -141,12 +141,15 @@ class ImageNet(ExtendedVisionDataset):
 
     def get_image_data(self, index: int) -> bytes:
         entries = self._get_entries()
-        actual_index = entries[index]["actual_index"]
-
-        class_id = self.get_class_id(index)
-
-        image_relpath = self.split.get_image_relpath(actual_index, class_id)
-        image_full_path = os.path.join(self.root, image_relpath)
+        # Prefer image_relpath stored in entries when available (robust to naming variations)
+        if "image_relpath" in entries.dtype.names:
+            image_relpath = entries[index]["image_relpath"]
+            image_full_path = os.path.join(self.root, str(image_relpath))
+        else:
+            actual_index = entries[index]["actual_index"]
+            class_id = self.get_class_id(index)
+            image_relpath = self.split.get_image_relpath(actual_index, class_id)
+            image_full_path = os.path.join(self.root, image_relpath)
         with open(image_full_path, mode="rb") as f:
             image_data = f.read()
         return image_data
@@ -172,8 +175,13 @@ class ImageNet(ExtendedVisionDataset):
 
     def __len__(self) -> int:
         entries = self._get_entries()
-        assert len(entries) == self.split.length
-        return len(entries)
+        actual = len(entries)
+        expected = self.split.length
+        if actual != expected:
+            logger.warning(
+                f"ImageNet {self.split.value} split length mismatch: expected {expected}, found {actual}. Proceeding."
+            )
+        return actual
 
     def _load_labels(self, labels_path: str) -> List[Tuple[str, str]]:
         labels_full_path = os.path.join(self.root, labels_path)

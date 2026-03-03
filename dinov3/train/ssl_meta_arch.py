@@ -703,7 +703,12 @@ class SSLMetaArch(nn.Module):
         raise NotImplementedError
 
     def backprop_loss(self, loss):
-        loss.backward()
+        # If a GradScaler is attached to the model (for fp16 AMP), use it to scale the backward pass.
+        grad_scaler = getattr(self, "_grad_scaler", None)
+        if grad_scaler is not None and isinstance(grad_scaler, torch.cuda.amp.GradScaler):
+            grad_scaler.scale(loss).backward()
+        else:
+            loss.backward()
 
     def update_ema(self, m):
         if self.ema_params_lists is None:
@@ -740,6 +745,14 @@ class SSLMetaArch(nn.Module):
             torch._foreach_add_(gramteacher_param_list, teacher_param_list, alpha=1 - m)
 
     def build_data_augmentation_dino(self, cfg):
+        # support both new (band_mean/band_std) and legacy (rgb_mean/rgb_std) keys in configs
+        mean = getattr(cfg.crops, "band_mean", None)
+        std = getattr(cfg.crops, "band_std", None)
+        if mean is None or std is None:
+            # fallback to legacy names for backward compatibility
+            mean = getattr(cfg.crops, "rgb_mean", None)
+            std = getattr(cfg.crops, "rgb_std", None)
+
         return DataAugmentationDINO(
             cfg.crops.global_crops_scale,
             cfg.crops.local_crops_scale,
@@ -751,8 +764,8 @@ class SSLMetaArch(nn.Module):
             local_crops_subset_of_global_crops=cfg.crops.localcrops_subset_of_globalcrops,
             share_color_jitter=cfg.crops.share_color_jitter,
             horizontal_flips=cfg.crops.horizontal_flips,
-            mean=cfg.crops.rgb_mean,
-            std=cfg.crops.rgb_std,
+            mean=mean,
+            std=std,
         )
 
     def get_maybe_fused_params_for_submodel(self, m: nn.Module):

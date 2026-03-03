@@ -10,7 +10,8 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k
+from .datasets import ADE20K, CocoCaptions, ImageNet, ImageNet22k, BigEarthNet12Band, GeoBenchCls12
+from .datasets import CoreS2L2A
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 logger = logging.getLogger("dinov3")
@@ -50,8 +51,12 @@ def _parse_dataset_str(dataset_str: str):
     kwargs = {}
 
     for token in tokens[1:]:
-        key, value = token.split("=")
-        assert key in ("root", "extra", "split")
+        parts = token.split("=", 1)
+        if len(parts) != 2:
+            raise ValueError(f"Invalid token '{token}' in dataset string '{dataset_str}'. Expected 'key=value'.")
+        key, value = parts
+        if key not in ("root", "extra", "split", "partition_name", "band_masking_prob"):
+            raise ValueError(f"Invalid key '{key}' in dataset string '{dataset_str}'. Allowed keys: root, extra, split, partition_name, band_masking_prob.")
         kwargs[key] = value
 
     if name == "ImageNet":
@@ -68,8 +73,46 @@ def _parse_dataset_str(dataset_str: str):
         class_ = CocoCaptions
         if "split" in kwargs:
             kwargs["split"] = CocoCaptions.Split[kwargs["split"]]
+    elif name == "BigEarthNet12Band":
+        # BigEarthNet 12-band Sentinel-2 patches
+        # Expected kwargs: root=<path to BigEarthNet-S2 root>, band_masking_prob=<float>
+        class_ = BigEarthNet12Band
+        if "band_masking_prob" in kwargs:
+            kwargs["band_masking_prob"] = float(kwargs["band_masking_prob"])
+    elif name == "GeoBenchCls12":
+        # GeoBench classification adapter for 12-band inputs (e.g. m-forestnet)
+        # Expected kwargs: root=<geobench classification task root>, split=TRAIN|VAL|TEST
+        class_ = GeoBenchCls12
+        if "split" in kwargs:
+            kwargs["split"] = GeoBenchCls12.Split[kwargs["split"]]
+    elif name == "GeoBenchCls":
+        # Check if the root path indicates a 12-band dataset that should use the 12-band adapter
+        # Heuristic: if 'm-eurosat' or 'm-bigearthnet' is in root path, switch to GeoBenchCls12
+        # This allows users to keep using "GeoBenchCls" string in config but get correct 12-band handling.
+        root_path = kwargs.get("root", "")
+        if "m-eurosat" in root_path or "m-bigearthnet" in root_path or "m-forestnet" in root_path:
+             class_ = GeoBenchCls12
+             if "split" in kwargs:
+                 # Map split string to GeoBenchCls12 enum if slightly different (usually same)
+                 kwargs["split"] = GeoBenchCls12.Split[kwargs["split"]]
+        else:
+             from .geobench import GeoBenchCls
+             class_ = GeoBenchCls
+             if "split" in kwargs:
+                 kwargs["split"] = GeoBenchCls.Split[kwargs["split"]]
+        
+        if "extra" in kwargs:
+            extra = kwargs.pop("extra")
+            if extra:
+                kwargs["band_names"] = tuple(extra.split(","))
     else:
-        raise ValueError(f'Unsupported dataset "{name}"')
+        # Support Core-S2L2A dataset string: CoreS2L2A:root=...:band_masking_prob=0.3
+        if name == "CoreS2L2A":
+            class_ = CoreS2L2A
+            if "band_masking_prob" in kwargs:
+                kwargs["band_masking_prob"] = float(kwargs["band_masking_prob"])
+        else:
+            raise ValueError(f'Unsupported dataset "{name}"')
 
     return class_, kwargs
 

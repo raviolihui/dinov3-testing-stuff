@@ -19,7 +19,7 @@ teacher:
 crops:
   # For 12-band data we set per-channel mean/std. These are placeholders (no normalization).
   # It's recommended to compute dataset statistics and replace these values.
-  rgb_mean: [
+  band_mean: [
     0.08968267921350617,
     0.08937971919304992,
     0.07754635287737796,
@@ -33,7 +33,7 @@ crops:
     0.1576949613459183,
     0.10577378558591129
   ]
-  rgb_std: [
+  band_std: [
     0.13908576098268433,
     0.13606287184313895,
     0.15512758607875962,
